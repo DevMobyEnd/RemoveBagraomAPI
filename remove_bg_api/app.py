@@ -1,30 +1,38 @@
-import tensorflow as tf
-from tensorflow.keras import models, layers
-from tensorflow.keras.preprocessing import image
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-from rembg import remove, new_session
-from PIL import Image, ImageEnhance, ImageFilter
 import os
 import io
 import logging
 import hashlib
-from functools import lru_cache
 import numpy as np
+from functools import lru_cache
+from dotenv import load_dotenv
+from flask import Flask, request, jsonify, send_file, render_template
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
+from rembg import remove, new_session
+from PIL import Image, ImageEnhance, ImageFilter
+import tensorflow as tf
+from tensorflow.keras import models, layers
+from tensorflow.keras.preprocessing import image
 from apscheduler.schedulers.background import BackgroundScheduler
+
+# Cargar variables de entorno
+load_dotenv()
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Crear la aplicación Flask y configurar CORS
 app = Flask(__name__)
 CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Configuración adicional de Flask
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-UPLOAD_FOLDER = 'uploads/'
-PROCESSED_FOLDER = 'static/'
+# Usar variables de entorno para las rutas
+UPLOAD_FOLDER = os.getenv('UPLOAD_FOLDER', 'uploads/')
+PROCESSED_FOLDER = os.getenv('PROCESSED_FOLDER', 'static/')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
@@ -80,26 +88,35 @@ def create_unet_model():
 
 try:
     model = models.load_model('background_removal_model.h5')
-    logging.info("Modelo cargado exitosamente.")
+    logger.info("Modelo cargado exitosamente.")
 except:
-    logging.info("Creando nuevo modelo...")
+    logger.info("Creando nuevo modelo...")
     model = create_unet_model()
-
 
 # Función para entrenar el modelo con nuevas imágenes
 def train_model_with_new_data():
     processed_images = os.listdir(PROCESSED_FOLDER)
-    if len(processed_images) > 200:  # Aumentado a 200 imágenes para un mejor entrenamiento
+    total_images = len(processed_images)
+    
+    update_progress(total_images, 200)
+    
+    if total_images > 200:
         X, y = [], []
-        for img_name in processed_images[:200]:
+        for i, img_name in enumerate(processed_images[:200]):
             original = Image.open(os.path.join(UPLOAD_FOLDER, img_name.replace('processed_', '')))
             processed = Image.open(os.path.join(PROCESSED_FOLDER, img_name))
             X.append(image.img_to_array(original.resize((256, 256))))
             y.append(image.img_to_array(processed.resize((256, 256))))
+            update_progress(i+1, 200)
+        
         X = np.array(X) / 255.0
         y = np.array(y) / 255.0
-        model.fit(X, y, epochs=10, batch_size=16, validation_split=0.2)  # Aumentado a 10 épocas
+        
+        history = model.fit(X, y, epochs=10, batch_size=16, validation_split=0.2,
+                            callbacks=[TrainingCallback(update_progress)])
+        
         model.save('background_removal_model.h5')
+        logger.info("Modelo entrenado y guardado exitosamente.")
 
 # Implementar caché para imágenes procesadas
 @lru_cache(maxsize=100)
@@ -116,9 +133,9 @@ def process_image(image_hash):
             input_image,
             session=session,
             alpha_matting=True,
-            alpha_matting_foreground_threshold=220,  # Ajustado
-            alpha_matting_background_threshold=20,   # Ajustado
-            alpha_matting_erode_size=10,             # Añadido
+            alpha_matting_foreground_threshold=220,
+            alpha_matting_background_threshold=20,
+            alpha_matting_erode_size=10,
             post_process_mask=True,
             only_mask=False
         )
@@ -152,7 +169,28 @@ def process_image(image_hash):
         final_output.save(final_byte_arr, format='PNG')
         return final_byte_arr.getvalue()
 
-# El resto del código permanece igual
+# Ruta del dashboard
+@app.route('/dashboard')
+def dashboard():
+    return render_template('dashboard.html')
+
+# Función para actualizar el progreso
+def update_progress(processed_count, total_count, epoch=None, loss=None, accuracy=None):
+    socketio.emit('update_progress', {
+        'processed_count': processed_count,
+        'total_count': total_count,
+        'epoch': epoch,
+        'loss': loss,
+        'accuracy': accuracy
+    })
+
+class TrainingCallback(tf.keras.callbacks.Callback):
+    def __init__(self, update_func):
+        self.update_func = update_func
+
+    def on_epoch_end(self, epoch, logs=None):
+        self.update_func(200, 200, epoch+1, logs.get('loss'), logs.get('accuracy'))
+
 @app.route('/')
 def home():
     return jsonify({'message': 'Bienvenido a la API de eliminación de fondo'}), 200
@@ -168,27 +206,31 @@ def remove_background():
     
     if file:
         try:
-            # Guardar el archivo temporalmente
-            file_hash = hashlib.md5(file.read()).hexdigest()
-            file.seek(0)
-            file_path = os.path.join(UPLOAD_FOLDER, f"{file_hash}.png")
-            file.save(file_path)
+            # Generar un hash único para la imagen
+            image_hash = hashlib.md5(file.read()).hexdigest()
+            file.seek(0)  # Reiniciar el puntero del archivo
+
+            # Guardar el archivo original
+            original_file_path = os.path.join(UPLOAD_FOLDER, f"{image_hash}.png")
+            file.save(original_file_path)
             
             # Procesar la imagen
-            output = process_image(file_hash)
+            output = process_image(image_hash)
             
-            # Eliminar el archivo temporal
-            os.remove(file_path)
+            # Guardar la imagen procesada
+            processed_file_path = os.path.join(PROCESSED_FOLDER, f"processed_{image_hash}.png")
+            with open(processed_file_path, 'wb') as f:
+                f.write(output)
             
             return send_file(
                 io.BytesIO(output),
                 mimetype='image/png',
-                as_attachment=True,
-                attachment_filename='removed_background.png'
+                as_attachment=True, 
+                download_name=f"processed_{image_hash}.png"
             )
         except Exception as e:
-            logging.error(f"Error al procesar la imagen: {str(e)}")
-            logging.exception("Excepción completa:")
+            logger.error(f"Error al procesar la imagen: {str(e)}")
+            logger.exception("Excepción completa:")
             return jsonify({'error': f'Error al procesar la imagen: {str(e)}'}), 500
 
 @app.errorhandler(404)
@@ -197,7 +239,8 @@ def not_found(error):
 
 @app.errorhandler(500)
 def server_error(error):
-    return jsonify({'error': 'Error interno del servidor'}), 500
+    return jsonify({'error': 'Error interno del servidor'}
+    ), 500
 
 if __name__ == '__main__':
     # Programar el entrenamiento periódico
